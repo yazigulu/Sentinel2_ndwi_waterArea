@@ -1,0 +1,318 @@
+// Area of interest
+var areaOfInterest =
+    ee.Geometry.Polygon(
+        [[[34.216340742214015, 38.941593609941926],
+          [34.216340742214015, 38.94007484916982],
+          [34.218572340114406, 38.94007484916982],
+          [34.218572340114406, 38.941593609941926]]]);
+
+// Zoom to area of interest
+Map.centerObject(areaOfInterest);
+Map.addLayer(areaOfInterest);
+
+var startDate = '2021-03-01';
+var endDate = '2021-08-31';
+
+// Load Sentinel-2 data
+// Sentinel-2 Level-2A
+var collectionS2 = ee.ImageCollection('COPERNICUS/S2_SR')
+                  .filterBounds(areaOfInterest)
+                  .filterDate(startDate, endDate)
+                  // Pre-filter to get less cloudy granules.
+                  //.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',10))
+                  .map(function(image){return image.clip(areaOfInterest)});
+print(collectionS2);
+
+// Visualize using RGB
+Map.addLayer(collectionS2.first(), {min: 0.0, max: 2000, bands: ['B4', 'B3', 'B2']}, 'RGB');
+
+var tempTimeSeries_wholeImage = ui.Chart.image.series(
+    collectionS2, areaOfInterest, ee.Reducer.sum(), 60, 'system:time_start')
+        .setChartType('ColumnChart')
+        .setOptions({
+          isStacked: '10', // desired cloud percentage
+          title: 'Cloudiness over time in whole Sentinel-2 Scene',
+          vAxis: {title: 'Cloud Area Distribution (%)'},
+          lineWidth: 1,
+          pointSize: 4,
+          series: {
+            0: {color: 'FF0000'}, // red
+            1: {color: '00FF00'}, //green
+            2: {color: '0000FF'}  //blue
+}});
+print(tempTimeSeries_wholeImage);
+
+
+// Cloud masking  to apply cloud masking to remove cloudy pixels from the analysis
+function maskCloudAndShadows(image) {
+  var collectionS2 = ee.ImageCollection('COPERNICUS/S2_SR');
+  var cloudProb = image.select('MSK_CLDPRB');
+  var snowProb = image.select('MSK_SNWPRB');
+  var cloud = cloudProb.lt(5);
+  var snow = snowProb.lt(5);
+  var scl = image.select('SCL'); 
+  var shadow = scl.eq(3); // 3 = cloud shadow
+  var cirrus = scl.eq(10); // 10 = cirrus
+  // Cloud probability less than 5% or cloud shadow classification
+  var mask = (cloud.and(snow)).and(cirrus.neq(1)).and(shadow.neq(1)).rename('cloudy_mask');
+  return image.addBands(mask).updateMask(mask);
+}
+
+// Use Sentinel-2 L2A data - which has better cloud masking
+var collectionNoCloud = collectionS2.map(maskCloudAndShadows);
+print("No Cloud = ", collectionNoCloud);
+
+
+//////Cloud-Mask Over Time
+var chart_cldmask = ui.Chart.image.series({
+    imageCollection: collectionNoCloud.select('cloudy_mask'),
+    region: areaOfInterest
+    }).setOptions({
+      interpolateNulls: true,
+      lineWidth: 1,
+      pointSize: 3,
+      title: 'Cloud Percentage over Time at a Single Location',
+      vAxis: {title: 'Cloud Percentage-Time'},
+      hAxis: {title: 'Date', format: 'YYYY-MMM-dd', gridlines: {count: 12}}
+    });
+print(chart_cldmask);
+
+var timeSeriescld = ee.ImageCollection(collectionNoCloud.map(function(image) {
+  var stats = image.reduceRegion({
+    reducer: ee.Reducer.median(),
+    geometry: areaOfInterest,
+    scale: 10,
+    //maxPixels: 1e10
+  });
+  
+    // reduceRegion doesn't return any output if the image doesn't intersect
+    // with the region or if the image is masked out due to cloud
+    // If there was no ndwi value found, we set the ndwi to a NoData value -9999
+    var cld = ee.List([stats.get('cloudy_mask'), -9999])
+      .reduce(ee.Reducer.firstNonNull());
+   
+    // Create a feature with null geometry and NDWI value and date as properties
+    var f = ee.Feature(null, {'cloudy_mask': cld,
+      'date': ee.Date(image.get('system:time_start')).format('YYYY-MM-dd')});
+    return f;
+  }));
+  
+  // Check the results
+  //print(timeSeries.first());
+   
+  // Export to CSV
+  Export.table.toDrive({
+      collection: timeSeriescld,
+      description: 'Single_Location_Cloudy_Prcentage_Time_Series',
+      folder: 'earthengine',
+      fileNamePrefix: 'cloud_percentage',
+      fileFormat: 'CSV'
+  });
+
+//var getCloudScores = function(img){
+    //Get the cloud cover
+   // var value = ee.Image(img).get('cloudy_mask');
+    //return ee.Feature(null, {'score': value});
+//};
+
+//var results = collectionNoCloud.map(getCloudScores);
+//print(Chart.feature.byFeature(results));
+//var results = collectionNoCloud.select('cloudy_mask');
+//var results = collectionNoCloud.map(getCloudScores);
+//print(Chart.feature.byFeature(results));
+
+//////// you can check the below code.
+///////https://gis.stackexchange.com/questions/319589/creating-water-and-vegetation-mask-via-image-collection
+///////////////////
+
+/////////////////////////////////
+////https://gis.stackexchange.com/questions/367281/calculating-area-of-water-pixels-and-plotting-them-in-google-earth-engine
+////////////////////////////////////////////
+var ndwi_threshold = -0.2;
+// Function to extract water, then calculate area of water pixel 
+var waterfunction = function(image){
+  //add the NDWI band to the image
+  var ndwi = image.normalizedDifference(['B3', 'B5']);
+  
+  //get pixels above the threshold (non-water part of the image)
+  var water_ = ndwi.gt(ndwi_threshold);
+  //extract only ndwi pixels 
+  //image = image.updateMask(ndwi_thres);
+  // then rename the band 
+  var ndwiArea = water_
+                         .multiply(ee.Image.pixelArea())
+                         .rename('ndwi')
+                         .divide(1e6);
+                    
+  image = image.addBands(ndwiArea).updateMask(water_);
+  
+  //get pixels above the threshold for the water pixels
+  //var water1 = ndwi.gt(-0.2);
+  //convert all pixels to value 1
+  //var water01 = water1.divide(water1);
+  
+// now to calculate water area, multiply water01 (all values are 1) by ee.Image.pixelArea; since that image gives us the area of each pixel
+// then rename the band 
+  var waterArea = water_
+                         .multiply(ee.Image.pixelArea())
+                         .rename('waterArea')
+                         .divide(1e6);
+  //extract only water pixels 
+  //image = image.updateMask(waterArea);
+
+// adding area of water as a band
+  image = image.addBands(waterArea);
+
+// calculate area 
+  var stats = waterArea.reduceRegion({
+    reducer: ee.Reducer.sum(), 
+    geometry:areaOfInterest, 
+    scale: 10,
+  })
+  ;
+
+  return image.set(stats);
+};
+
+// mapping water function over my collection 
+var collection = collectionNoCloud.map(waterfunction);
+print('collection',collection);
+
+var ndwifiltered = collection.select('ndwi')
+  .filter(ee.Filter.bounds(areaOfInterest));
+
+var waterfiltered = collection.select('waterArea')
+  .filter(ee.Filter.bounds(areaOfInterest));
+
+//////NDWI-Mask Over Time
+var chart_ndwimask = ui.Chart.image.series({
+    imageCollection: collection.select('ndwi'),
+    region: areaOfInterest
+    }).setOptions({
+      interpolateNulls: true,
+      lineWidth: 1,
+      pointSize: 3,
+      title: 'NDWI-Mask over Time at a Single Location',
+      vAxis: {title: 'NDWI-Mask'},
+      hAxis: {title: 'Date', format: 'YYYY-MMM-dd', gridlines: {count: 12}}
+    });
+print(chart_ndwimask);
+
+var timeSeries = ee.ImageCollection(ndwifiltered.map(function(image) {
+  var stats = image.reduceRegion({
+    reducer: ee.Reducer.median(),
+    geometry: areaOfInterest,
+    scale: 10,
+    maxPixels: 1e10
+  });
+  
+    // reduceRegion doesn't return any output if the image doesn't intersect
+    // with the region or if the image is masked out due to cloud
+    // If there was no ndwi value found, we set the ndwi to a NoData value -9999
+    var ndwi = ee.List([stats.get('ndwi'), -9999])
+      .reduce(ee.Reducer.firstNonNull());
+   
+    // Create a feature with null geometry and NDWI value and date as properties
+    var f = ee.Feature(null, {'ndwi': ndwi,
+      'date': ee.Date(image.get('system:time_start')).format('YYYY-MM-dd')});
+    return f;
+  }));
+  
+  // Check the results
+  //print(timeSeries.first());
+   
+  // Export to CSV
+  Export.table.toDrive({
+      collection: timeSeries,
+      description: 'Single_Location_NDWI_time_series',
+      folder: 'earthengine',
+      fileNamePrefix: 'ndwi_time_series_single',
+      fileFormat: 'CSV'
+  });
+
+//////Water Area Over Time
+var chart_water_mask = ui.Chart.image.series({
+    imageCollection: collection.select('waterArea'),
+    region: areaOfInterest
+    }).setOptions({
+      interpolateNulls: true,
+      lineWidth: 1,
+      pointSize: 3,
+      title: 'Water Area over Time at a Single Location',
+      vAxis: {title: 'Water Area (km2)'},
+      hAxis: {title: 'Date', format: 'YYYY-MMM-dd', gridlines: {count: 12}}
+    });
+print("Water Mask Graph", chart_water_mask);
+
+
+var timeSeries = ee.ImageCollection(waterfiltered.map(function(image) {
+  var stats_water = image.reduceRegion({
+    reducer: ee.Reducer.median(),
+    geometry: areaOfInterest,
+    scale: 10,
+    maxPixels: 1e10
+  });
+  return stats_water;
+}));
+
+  // Check the results
+  //print(timeSeries.first());
+   
+  // Export to CSV
+  Export.table.toDrive({
+      collection: timeSeries,
+      description: 'Single_Location_Water_Area_Time_Series',
+      folder: 'earthengine',
+      fileNamePrefix: 'water_area_time_series_single',
+      fileFormat: 'CSV'
+  });
+ 
+var cld_mask = collectionNoCloud.select('cloudy_mask');
+var visParams= {min: -0.2, 
+    max: 1, 
+    bands: 'cloudy_mask', 
+    palette: ['black', 'white']};
+Map.addLayer(cld_mask.first(), visParams,'Cloud Mask'); 
+
+var ndwi_mask = collection.select('ndwi');
+Map.addLayer(
+    ndwi_mask.first(),
+    {palette:['black', 'white']},
+    'NDWI Binary Mask');
+//var vizParams_ndwi = {
+ // palette: ['red', 'yellow', 'green', 'cyan', 'blue'], //'red', 'yellow', 'green', 'cyan', 'blue'
+ // min: 300,
+  //max: 1500,
+  //gamma: [0.95, 1.1, 1]
+//};
+//var visParams_ndwi= {min: -0.2, 
+  ///  max: 1, 
+  //  bands: 'ndwi', 
+   // palette: ['00FFFF', '0000FF']};
+//Map.addLayer(ndwi_mask.first(), vizParams_ndwi, 'NDWI false color composite');
+
+var water_mask = collection.select('waterArea');
+//Map.addLayer(water_mask.first(), {palette:['blue']}, 'NDWI Mask');
+//var visParams= {min: -0.2, 
+  // max: 1, 
+ //  bands: 'waterArea', 
+  // palette: ['black', 'white'],
+  // name: 'Water Area Binary Mask'};
+Map.addLayer(
+    water_mask.first(),
+    {palette:['blue']},
+    'Water Mask'); 
+
+var csv = ee.ImageCollection([
+   ndwi_mask,
+   water_mask,
+   cld_mask,
+]).flatten();
+
+Export.table.toDrive({
+      collection: csv,
+      description: 'Single_Location_Time_Series',
+      folder: 'earthengine',
+      fileNamePrefix: 'time_series_single',
+      fileFormat: 'CSV'
+  });
